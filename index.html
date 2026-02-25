@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>VR Peach Castle Exterior</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #enterVR {
+            position: fixed;
+            top: 45%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 20px 30px;
+            font-size: 20px;
+            border: none;
+            border-radius: 12px;
+            background: #e60012;
+            color: white;
+            z-index: 10;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+        }
+        #toggleWalking {
+            position: fixed;
+            top: 60%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 15px 20px;
+            font-size: 16px;
+            border: 2px solid #e60012;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #e60012;
+            z-index: 10;
+            cursor: pointer;
+        }
+        #infoNote {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            font-size: 12px;
+            text-align: center;
+            width: 80%;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+
+<button id="enterVR">Enter the world</button>
+<button id="toggleWalking">Walking Mode: OFF</button>
+<audio id="bgm" src="audio.mp3" loop></audio>
+<div id="infoNote">
+    Terrain-following keeps your eye height at 1.6m above Peach Castle grounds.<br>
+    Walking Mode uses your phone's motion sensors for forward steps.
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160/build/three.module.js",
+        "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/examples/jsm/webxr/VRButton.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
+let scene, camera, renderer, cameraRig;
+let roomModel;
+const clock = new THREE.Clock();
+
+let remoteInput = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
+
+let walkingModeEnabled = false;
+let stepMovementRemaining = 0;
+let lastStepTime = 0;
+const STEP_COOLDOWN = 300;
+const STEP_THRESHOLD = 10.6;
+const STEP_SIZE = 0.3;
+
+const MODEL_NAME = 'peach castle exterior.glb';
+const EYE_HEIGHT_METERS = 0.16;
+
+// Approximate SM64 castle-grounds bridge spawn and facing toward castle.
+const MARIO_SPAWN_X = 0.0;
+const MARIO_SPAWN_Z = -6.2;
+const MARIO_SPAWN_YAW = Math.PI;
+
+const MOVE_SPEED = 0.05;
+const ROTATION_SPEED = 0.03;
+
+const terrainMeshes = [];
+const downVector = new THREE.Vector3(0, -1, 0);
+const groundRaycaster = new THREE.Raycaster();
+const tempCameraWorldPosition = new THREE.Vector3();
+const tempGroundProbeOrigin = new THREE.Vector3();
+const tempFaceNormal = new THREE.Vector3();
+const tempMoveDirection = new THREE.Vector3();
+
+let hasGroundLock = false;
+let lastGroundY = 0;
+const MIN_WALKABLE_NORMAL_Y = 0.35;
+const MAX_STEP_UP = 1.2;
+const MAX_STEP_DOWN = 3.0;
+const NEAR_PROBE_DISTANCE = 8.0;
+const FAR_PROBE_DISTANCE = 50.0;
+
+async function pollInput() {
+    try {
+        const response = await fetch('/state');
+        remoteInput = await response.json();
+    } catch (err) {
+        // Ignore polling errors when remote input is unavailable.
+    }
+    setTimeout(pollInput, 30);
+}
+pollInput();
+
+init();
+animate();
+
+function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+    cameraRig = new THREE.Group();
+    cameraRig.position.set(MARIO_SPAWN_X, EYE_HEIGHT_METERS, MARIO_SPAWN_Z);
+    cameraRig.rotation.y = MARIO_SPAWN_YAW;
+    cameraRig.add(camera);
+    scene.add(cameraRig);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    renderer.shadowMap.enabled = true;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.2;
+    document.body.appendChild(renderer.domElement);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 1.5);
+    scene.add(ambient);
+
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    sunLight.position.set(5, 15, 5);
+    scene.add(sunLight);
+
+    loadRoom();
+
+    window.addEventListener('resize', onResize);
+}
+
+function loadRoom() {
+    const loader = new GLTFLoader();
+    loader.load(
+        MODEL_NAME,
+        (gltf) => {
+            roomModel = gltf.scene;
+
+            roomModel.traverse((child) => {
+                if (child.isMesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true;
+                    if (child.material) child.material.side = THREE.DoubleSide;
+                    terrainMeshes.push(child);
+                }
+            });
+
+            scene.add(roomModel);
+
+            snapToSpawnHeight();
+
+            const vrButton = VRButton.createButton(renderer);
+            vrButton.style.display = 'none';
+            document.body.appendChild(vrButton);
+
+            const enterVRBtn = document.getElementById('enterVR');
+            const toggleWalkingBtn = document.getElementById('toggleWalking');
+            const infoNote = document.getElementById('infoNote');
+            const bgm = document.getElementById('bgm');
+
+            enterVRBtn.onclick = () => {
+                bgm.play().catch(() => {});
+                vrButton.click();
+                enterVRBtn.style.display = 'none';
+                toggleWalkingBtn.style.display = 'none';
+                infoNote.style.display = 'none';
+            };
+
+            toggleWalkingBtn.onclick = () => {
+                requestMotionPermission();
+            };
+        },
+        undefined,
+        (err) => {
+            console.error('Failed to load Peach Castle model:', err);
+        }
+    );
+}
+
+function snapToSpawnHeight() {
+    const groundY =
+        findGroundYAt(MARIO_SPAWN_X, MARIO_SPAWN_Z, 25, FAR_PROBE_DISTANCE) ??
+        findGroundYAt(MARIO_SPAWN_X, MARIO_SPAWN_Z, 5, FAR_PROBE_DISTANCE) ??
+        0;
+
+    lastGroundY = groundY;
+    hasGroundLock = true;
+
+    cameraRig.position.set(MARIO_SPAWN_X, groundY + EYE_HEIGHT_METERS, MARIO_SPAWN_Z);
+    cameraRig.rotation.y = MARIO_SPAWN_YAW;
+}
+
+function findGroundYAt(x, z, startY, maxDistance) {
+    if (!terrainMeshes.length) return null;
+
+    tempGroundProbeOrigin.set(x, startY, z);
+    groundRaycaster.set(tempGroundProbeOrigin, downVector);
+    groundRaycaster.far = maxDistance;
+
+    const hits = groundRaycaster.intersectObjects(terrainMeshes, false);
+    for (const hit of hits) {
+        if (!hit.face) continue;
+        tempFaceNormal.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+        if (Math.abs(tempFaceNormal.y) >= MIN_WALKABLE_NORMAL_Y) {
+            return hit.point.y;
+        }
+    }
+
+    return null;
+}
+
+function lockEyeHeightToGround() {
+    if (!roomModel || !terrainMeshes.length) return;
+
+    camera.getWorldPosition(tempCameraWorldPosition);
+
+    const nearProbeStartY = hasGroundLock
+        ? lastGroundY + EYE_HEIGHT_METERS + MAX_STEP_UP
+        : tempCameraWorldPosition.y + 3;
+
+    let groundY = findGroundYAt(
+        tempCameraWorldPosition.x,
+        tempCameraWorldPosition.z,
+        nearProbeStartY,
+        NEAR_PROBE_DISTANCE
+    );
+
+    if (groundY === null) {
+        groundY = findGroundYAt(
+            tempCameraWorldPosition.x,
+            tempCameraWorldPosition.z,
+            tempCameraWorldPosition.y + 20,
+            FAR_PROBE_DISTANCE
+        );
+    }
+
+    if (groundY === null) return;
+
+    if (!hasGroundLock) {
+        lastGroundY = groundY;
+        hasGroundLock = true;
+    } else {
+        const clampedGroundY = THREE.MathUtils.clamp(
+            groundY,
+            lastGroundY - MAX_STEP_DOWN,
+            lastGroundY + MAX_STEP_UP
+        );
+        lastGroundY = THREE.MathUtils.lerp(lastGroundY, clampedGroundY, 0.45);
+    }
+
+    const desiredEyeY = lastGroundY + EYE_HEIGHT_METERS;
+    cameraRig.position.y += desiredEyeY - tempCameraWorldPosition.y;
+}
+
+function requestMotionPermission() {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+        DeviceMotionEvent.requestPermission()
+            .then((permissionState) => {
+                if (permissionState === 'granted') {
+                    toggleWalkingMode();
+                } else {
+                    alert('Motion permission denied');
+                }
+            })
+            .catch(console.error);
+    } else {
+        toggleWalkingMode();
+    }
+}
+
+function toggleWalkingMode() {
+    walkingModeEnabled = !walkingModeEnabled;
+    const btn = document.getElementById('toggleWalking');
+    btn.innerText = `Walking Mode: ${walkingModeEnabled ? 'ON' : 'OFF'}`;
+    btn.style.background = walkingModeEnabled ? '#e60012' : 'rgba(255,255,255,0.9)';
+    btn.style.color = walkingModeEnabled ? 'white' : '#e60012';
+
+    if (walkingModeEnabled) {
+        window.addEventListener('devicemotion', handleMotion);
+    } else {
+        window.removeEventListener('devicemotion', handleMotion);
+        stepMovementRemaining = 0;
+    }
+}
+
+function handleMotion(event) {
+    let acc = event.acceleration;
+    let threshold = 2.0;
+
+    if (!acc || (acc.x === null && acc.y === null && acc.z === null)) {
+        acc = event.accelerationIncludingGravity;
+        threshold = STEP_THRESHOLD;
+    }
+
+    if (!acc || acc.x === null) return;
+
+    const mag = Math.sqrt(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+    const now = Date.now();
+
+    if (mag > threshold && now - lastStepTime > STEP_COOLDOWN) {
+        lastStepTime = now;
+        stepMovementRemaining += STEP_SIZE;
+        if (stepMovementRemaining > STEP_SIZE * 2) {
+            stepMovementRemaining = STEP_SIZE * 2;
+        }
+    }
+}
+
+function animate() {
+    renderer.setAnimationLoop(() => {
+        const delta = clock.getDelta();
+
+        camera.getWorldDirection(tempMoveDirection);
+        tempMoveDirection.y = 0;
+        if (tempMoveDirection.lengthSq() < 1e-6) {
+            tempMoveDirection.set(Math.sin(cameraRig.rotation.y), 0, -Math.cos(cameraRig.rotation.y));
+        } else {
+            tempMoveDirection.normalize();
+        }
+
+        const frameSpeed = MOVE_SPEED * delta * 60;
+        const frameRotationSpeed = ROTATION_SPEED * delta * 60;
+
+        if (remoteInput.ArrowUp) cameraRig.position.addScaledVector(tempMoveDirection, frameSpeed);
+        if (remoteInput.ArrowDown) cameraRig.position.addScaledVector(tempMoveDirection, -frameSpeed);
+        if (remoteInput.ArrowLeft) cameraRig.rotation.y += frameRotationSpeed;
+        if (remoteInput.ArrowRight) cameraRig.rotation.y -= frameRotationSpeed;
+
+        if (stepMovementRemaining > 0) {
+            const moveAmount = Math.min(stepMovementRemaining, frameSpeed);
+            cameraRig.position.addScaledVector(tempMoveDirection, moveAmount);
+            stepMovementRemaining -= moveAmount;
+        }
+
+        lockEyeHeightToGround();
+        renderer.render(scene, camera);
+    });
+}
+
+function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+</script>
+
+</body>
+</html>
