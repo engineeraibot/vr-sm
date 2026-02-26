@@ -78,8 +78,6 @@ let scene, camera, renderer, cameraRig;
 let roomModel;
 const clock = new THREE.Clock();
 
-let remoteInput = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
-
 let walkingModeEnabled = false;
 let stepMovementRemaining = 0;
 let lastStepTime = 0;
@@ -96,7 +94,6 @@ const MARIO_SPAWN_Z = -6.2;
 const MARIO_SPAWN_YAW = Math.PI;
 
 const MOVE_SPEED = 0.05;
-const ROTATION_SPEED = 0.03;
 
 const terrainMeshes = [];
 const downVector = new THREE.Vector3(0, -1, 0);
@@ -113,17 +110,6 @@ const MAX_STEP_UP = 1.2;
 const MAX_STEP_DOWN = 3.0;
 const NEAR_PROBE_DISTANCE = 8.0;
 const FAR_PROBE_DISTANCE = 50.0;
-
-async function pollInput() {
-    try {
-        const response = await fetch('/state');
-        remoteInput = await response.json();
-    } catch (err) {
-        // Ignore polling errors when remote input is unavailable.
-    }
-    setTimeout(pollInput, 30);
-}
-pollInput();
 
 init();
 animate();
@@ -351,12 +337,6 @@ function animate() {
         }
 
         const frameSpeed = MOVE_SPEED * delta * 60;
-        const frameRotationSpeed = ROTATION_SPEED * delta * 60;
-
-        if (remoteInput.ArrowUp) cameraRig.position.addScaledVector(tempMoveDirection, frameSpeed);
-        if (remoteInput.ArrowDown) cameraRig.position.addScaledVector(tempMoveDirection, -frameSpeed);
-        if (remoteInput.ArrowLeft) cameraRig.rotation.y += frameRotationSpeed;
-        if (remoteInput.ArrowRight) cameraRig.rotation.y -= frameRotationSpeed;
 
         if (stepMovementRemaining > 0) {
             const moveAmount = Math.min(stepMovementRemaining, frameSpeed);
